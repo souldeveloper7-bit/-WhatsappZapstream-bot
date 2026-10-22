@@ -1,32 +1,125 @@
-name: Node.js CI
+name: WhatsApp Bot
 
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch:
 
 jobs:
-  build-and-run:
+  run-bot:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 20.x
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          npm install
+          npm install qrcode
 
-      - name: Run index.js
-        run: node index.js
+      # QR ko PNG me save karne wala script
+      - name: Create QR saver wrapper
+        run: |
+          cat > save-qr.js << 'EOF'
+          const QRCode = require('qrcode');
+          const fs = require('fs');
+
+          // Baileys / any WA lib ka QR string yahan aayega
+          // Hum original index.js ko patch karke QR ko file me likhenge
+          const originalLog = console.log;
+          console.log = function (...args) {
+            const msg = args.join(' ');
+            if (msg.includes('QR') || msg.includes('qr')) {
+              originalLog('[QR LOG]', msg.slice(0, 80));
+            } else {
+              originalLog(...args);
+            }
+          };
+
+          // Global QR capture
+          global.saveQR = async (qrString) => {
+            try {
+              await QRCode.toFile('qr.png', qrString, {
+                width: 600,
+                margin: 2,
+                errorCorrectionLevel: 'M'
+              });
+              fs.writeFileSync('qr.txt', qrString);
+              originalLog('✅ QR saved to qr.png (scannable)');
+            } catch (e) {
+              originalLog('❌ QR save failed:', e.message);
+            }
+          };
+          EOF
+
+      - name: Patch index.js to save QR
+        run: |
+          # Backup
+          cp index.js index.js.bak
+
+          # Agar index.js me `qr` variable use hota hai (baileys style), toh uske baad saveQR call inject karo
+          node -e "
+          const fs = require('fs');
+          let code = fs.readFileSync('index.js', 'utf8');
+
+          // Case 1: if (qr) { ... } block
+          if (code.includes('if (qr)')) {
+            code = code.replace(/if\\s*\\(\\s*qr\\s*\\)\\s*\\{/g,
+              'if (qr) { if (global.saveQR) global.saveQR(qr);');
+          }
+
+          // Case 2: printQRInTerminal — usko false karo
+          code = code.replace(/printQRInTerminal\\s*:\\s*true/g, 'printQRInTerminal: false');
+
+          // Case 3: agar 'qr' string kabhi milta hai connection.update me
+          if (!code.includes('global.saveQR')) {
+            code = code.replace(/connection\\s*===\\s*['\"]open['\"]/g,
+              'if (update.qr && global.saveQR) global.saveQR(update.qr); connection === \"open\"');
+          }
+
+          fs.writeFileSync('index.js', code);
+          console.log('✅ index.js patched');
+          "
+
+      - name: Run bot (QR will be saved)
+        run: |
+          node -r ./save-qr.js index.js &
+          BOT_PID=$!
+
+          # Max 90 seconds wait karo QR generate hone ka
+          echo '⏳ Waiting for QR...'
+          for i in $(seq 1 90); do
+            if [ -f qr.png ]; then
+              echo "✅ QR generated after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          # Bot ko kill karo (QR mil gaya)
+          kill $BOT_PID 2>/dev/null || true
+          wait $BOT_PID 2>/dev/null || true
+
+          if [ ! -f qr.png ]; then
+            echo '❌ QR not generated in time. Check logs.'
+            exit 1
+          fi
+        timeout-minutes: 3
+
+      - name: Upload QR artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp-qr
+          path: |
+            qr.png
+            qr.txt
+          if-no-files-found: warn
+          retention-days: 1
